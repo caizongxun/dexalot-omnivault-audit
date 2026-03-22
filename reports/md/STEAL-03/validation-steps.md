@@ -1,9 +1,26 @@
 # STEAL-03 — Validation Steps
 
+## Environment
+
+```
+Forge 1.5.1-stable
+Solc 0.8.30
+OS: Kali Linux
+```
+
 ## Steps
 
+1. Clone the repo and install dependencies:
+
 ```bash
+git clone https://github.com/caizongxun/dexalot-omnivault-audit.git
 cd dexalot-omnivault-audit
+forge install foundry-rs/forge-std
+```
+
+2. Run the PoC:
+
+```bash
 forge test --match-test testSTEAL03_CollectSwapFeesDrainsExecutor -vvv
 ```
 

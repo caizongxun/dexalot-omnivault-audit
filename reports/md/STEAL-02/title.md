@@ -1,4 +1,4 @@
-# STEAL-02 — Settler Inflates Vault Balance on Withdrawal Batch
+# Critical: Settler-Inflated Withdrawal Balance Enables Disproportionate Fund Extraction
 
 | Field | Value |
 |-------|-------|

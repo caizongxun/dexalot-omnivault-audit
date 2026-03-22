@@ -1,4 +1,4 @@
-# STEAL-01 — Settler Falsely Low Vault Balance Inflates Shares
+# Critical: Unverified Settler-Supplied Vault Balance Enables Share Inflation and Full Fund Drain
 
 | Field | Value |
 |-------|-------|

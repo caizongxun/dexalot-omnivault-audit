@@ -1,4 +1,4 @@
-# POC-02 — Infinite Unwind Loop Permanently Blocks Settlement
+# Critical: Permissionless `unwindBatch` Enables Infinite Loop DoS, Permanently Blocking Settlement
 
 | Field | Value |
 |-------|-------|

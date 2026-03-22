@@ -1,4 +1,4 @@
-# STEAL-03 — `collectSwapFees` Has No Cap, Drains Entire Executor
+# Critical: Uncapped `collectSwapFees` Allows Compromised Trader to Drain Entire Executor
 
 | Field | Value |
 |-------|-------|

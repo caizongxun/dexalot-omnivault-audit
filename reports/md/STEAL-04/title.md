@@ -1,4 +1,4 @@
-# STEAL-04 — `requestId` Bit-Packing Overflow Causes Fund Lockup
+# Critical: `requestId` Bit-Packing uint16 Truncation Causes Permanent Fund Lockup via ID Collision
 
 | Field | Value |
 |-------|-------|

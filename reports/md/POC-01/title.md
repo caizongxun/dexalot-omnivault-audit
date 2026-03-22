@@ -1,4 +1,4 @@
-# POC-01 — `unwindBatch` Has No Access Control
+# Critical: Missing Access Control on `unwindBatch` Allows Anyone to Force UNWOUND State
 
 | Field | Value |
 |-------|-------|

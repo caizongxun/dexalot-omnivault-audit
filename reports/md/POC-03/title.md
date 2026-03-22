@@ -1,4 +1,4 @@
-# POC-03 — `price = 0` Causes Division-by-Zero, Batch Locked Forever
+# Critical: Zero Price in `finalizeBatch` Causes Division-by-Zero, Locking Batch in FINALIZED Forever
 
 | Field | Value |
 |-------|-------|

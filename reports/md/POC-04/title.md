@@ -1,4 +1,4 @@
-# POC-04 — Chained Settler + Unwind Attack Permanently Paralyzes Vault
+# Critical: Chained Compromised Settler and Permissionless Unwind Permanently Paralyzes Vault
 
 | Field | Value |
 |-------|-------|

